@@ -1,4 +1,4 @@
-import os, sys, re, csv, time, shutil, subprocess, threading, glob
+import os, sys, re, csv, time, shutil, tempfile, subprocess, threading, glob
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -16,8 +16,8 @@ OFFICE = WORD_SRC | EXCEL_SRC | PPT_SRC
 VIDEO_OUT = ["mp4", "avi", "mkv", "mov", "wmv", "webm", "gif", "mp3", "wav"]
 IMAGE_OUT = ["png", "jpg", "bmp", "gif", "tiff", "webp", "ico", "pdf"]
 PDF_OUT = ["docx", "png", "jpg", "txt"]
-WORD_OUT = ["pdf", "docx", "doc", "odt", "rtf", "txt", "html"]
-EXCEL_OUT = ["pdf", "xlsx", "xls", "csv", "ods", "html"]
+WORD_OUT = ["pdf", "docx", "doc", "xlsx", "odt", "rtf", "txt", "html"]
+EXCEL_OUT = ["pdf", "xlsx", "xls", "docx", "csv", "ods", "html"]
 PPT_OUT = ["pdf", "pptx", "ppt", "odp"]
 
 # ---------- Renkler ----------
@@ -313,8 +313,161 @@ def conv_builtin(src, ext, out, target):
     return True
 
 
+# ---------- Excel <-> Word (tablo dönüştürme) ----------
+def cell_txt(v):
+    import datetime
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    if isinstance(v, datetime.datetime):
+        return v.strftime("%d.%m.%Y") if v.time() == datetime.time(0) else v.strftime("%d.%m.%Y %H:%M")
+    if isinstance(v, datetime.date):
+        return v.strftime("%d.%m.%Y")
+    return str(v)
+
+
+def read_csv_rows(path):
+    text = read_text(path)
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
+    except csv.Error:
+        dialect = csv.excel
+    return [r for r in csv.reader(text.splitlines(), dialect)]
+
+
+def xlsx_to_sheets(path):
+    from openpyxl import load_workbook
+    wb = load_workbook(path, data_only=True)
+    res = []
+    for ws in wb.worksheets:
+        rows = [[cell_txt(c) for c in r] for r in ws.iter_rows(values_only=True)]
+        while rows and not any(rows[-1]):
+            rows.pop()
+        width = max((max((j + 1 for j, c in enumerate(r) if c), default=0) for r in rows), default=0)
+        rows = [r[:width] + [""] * (width - len(r)) for r in rows]
+        if rows and width:
+            res.append((ws.title, rows))
+    wb.close()
+    if not res:
+        raise RuntimeError("Excel dosyasında aktarılacak veri bulunamadı.")
+    return res
+
+
+def docx_to_sheets(path):
+    from docx import Document
+    d = Document(path)
+    sheets = [(f"Tablo{k}", [[c.text for c in r.cells] for r in t.rows])
+              for k, t in enumerate(d.tables, 1)]
+    if not sheets:  # tablo yoksa her paragraf bir satır
+        sheets = [("Metin", [[p.text] for p in d.paragraphs])]
+    return sheets
+
+
+def write_docx_tables(sheets, out, ctx):
+    from docx import Document
+    from docx.shared import Pt, Cm
+    from docx.enum.section import WD_ORIENT
+    d = Document()
+    maxcols = max(len(r) for _, rows in sheets for r in rows)
+    if maxcols > 6:  # geniş tablolar için yatay sayfa
+        sec = d.sections[0]
+        sec.orientation = WD_ORIENT.LANDSCAPE
+        sec.page_width, sec.page_height = sec.page_height, sec.page_width
+        sec.left_margin = sec.right_margin = Cm(1.5)
+    size = Pt(8 if maxcols > 10 else 9 if maxcols > 6 else 10)
+    total = sum(len(rows) for _, rows in sheets)
+    done = 0
+    for name, rows in sheets:
+        if len(sheets) > 1:
+            d.add_heading(name, level=2)
+        ncols = max(len(r) for r in rows)
+        t = d.add_table(rows=len(rows), cols=ncols)
+        t.style = "Table Grid"
+        for i, r in enumerate(rows):
+            cells = t.rows[i].cells
+            for j in range(ncols):
+                cell = cells[j]
+                cell.text = str(r[j]) if j < len(r) else ""
+                for par in cell.paragraphs:
+                    for run in par.runs:
+                        run.font.size = size
+                        if i == 0:
+                            run.font.bold = True
+            done += 1
+            if done % 25 == 0:
+                if ctx.cancel:
+                    raise Cancelled()
+                ctx.report(min(done / total, 0.99))
+        d.add_paragraph()
+    d.save(out)
+
+
+def to_cell(s):
+    if isinstance(s, str) and re.fullmatch(r"-?[1-9]\d{0,14}|0", s.strip()):
+        return int(s)
+    return s
+
+
+def write_xlsx(sheets, out):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    wb = Workbook()
+    for k, (name, rows) in enumerate(sheets):
+        ws = wb.active if k == 0 else wb.create_sheet()
+        ws.title = re.sub(r"[\\/*?:\[\]]", "_", name)[:31] or f"Sayfa{k + 1}"
+        for r in rows:
+            ws.append([to_cell(c) for c in r])
+        if len(rows) > 1:
+            for c in ws[1]:
+                c.font = Font(bold=True)
+        for col in ws.columns:
+            width = max((len(str(c.value)) for c in col if c.value is not None), default=8)
+            ws.column_dimensions[col[0].column_letter].width = min(max(width + 2, 8), 60)
+    wb.save(out)
+
+
+def conv_cross(src, ext, out, target, outdir, ctx):
+    """Excel -> Word ve Word -> Excel. Gerekirse önce ara biçime çevirir."""
+    tmpd = tempfile.mkdtemp(prefix="evr_")
+    inner = ""
+    try:
+        if ext in EXCEL_SRC:  # Excel -> Word
+            if ext == "csv":
+                sheets = [("Sayfa1", read_csv_rows(src))]
+            elif ext == "xlsx":
+                sheets = xlsx_to_sheets(src)
+            else:  # xls, ods -> önce xlsx
+                tmp_src = os.path.join(tmpd, "ara." + ext)
+                shutil.copy(src, tmp_src)
+                conv_office(tmp_src, ext, os.path.join(tmpd, "ara.xlsx"), "xlsx", tmpd, ctx)
+                inner = ctx.engine
+                sheets = xlsx_to_sheets(os.path.join(tmpd, "ara.xlsx"))
+            if not any(rows for _, rows in sheets):
+                raise RuntimeError("Dosyada aktarılacak veri bulunamadı.")
+            write_docx_tables(sheets, out, ctx)
+        else:  # Word -> Excel
+            if ext == "txt":
+                sheets = [("Metin", [[l] for l in read_text(src).splitlines()])]
+            elif ext == "docx":
+                sheets = docx_to_sheets(src)
+            else:  # doc, rtf, odt, html -> önce docx
+                tmp_src = os.path.join(tmpd, "ara." + ext)
+                shutil.copy(src, tmp_src)
+                conv_office(tmp_src, ext, os.path.join(tmpd, "ara.docx"), "docx", tmpd, ctx)
+                inner = ctx.engine
+                sheets = docx_to_sheets(os.path.join(tmpd, "ara.docx"))
+            write_xlsx(sheets, out)
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+    ctx.engine = (inner + " + " if inner else "") + "tablo dönüştürücü"
+    ctx.report(1.0)
+
+
 def conv_office(src, ext, out, target, outdir, ctx):
     """Sırayla dener: 1) Microsoft Office  2) LibreOffice  3) yerleşik basit dönüştürücü."""
+    if (ext in EXCEL_SRC and target == "docx") or (ext in WORD_SRC and target == "xlsx"):
+        return conv_cross(src, ext, out, target, outdir, ctx)
     ctx.report(None)
     ms_err = None
     try:
